@@ -1,0 +1,67 @@
+name: Build Windows native (CS2 1.41.9.7 net message fix)
+
+# 只编译 Windows 原生 counterstrikesharp.dll（基于 v1.0.378），给本地替换用；不发布、不碰 main 的流程。
+# SDK 子模块固定在 d4a8b46，编译前用 patches/hl2sdk-cs2 里改好的两个头文件覆盖（说明见 patches/README.md）。
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: ["fix-1.41.9.7"]
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build_windows:
+    runs-on: windows-latest
+    steps:
+      - name: Prepare env
+        shell: bash
+        run: |
+          echo "GITHUB_SHA_SHORT=${GITHUB_SHA::7}" >> $GITHUB_ENV
+          echo "SEMVER=1.0.378-netmsgfix" >> $GITHUB_ENV
+
+      - name: Visual Studio environment
+        shell: cmd
+        run: |
+          :: See https://github.com/microsoft/vswhere/wiki/Find-VC
+          for /f "usebackq delims=*" %%i in (`vswhere -latest -property installationPath`) do (
+            call "%%i"\Common7\Tools\vsdevcmd.bat -arch=x64 -host_arch=x64
+          )
+
+          :: Loop over all environment variables and make them global.
+          for /f "delims== tokens=1,2" %%a in ('set') do (
+            echo>>"%GITHUB_ENV%" %%a=%%b
+          )
+
+      - uses: actions/checkout@v7
+        with:
+          submodules: "recursive"
+
+      - name: Apply SDK patch (net message handles, CS2 14197)
+        shell: bash
+        run: |
+          test "$(git -C libraries/hl2sdk-cs2 rev-parse HEAD)" = "d4a8b46676ded25b9d956287ec40ef3c9e12c14c"
+          cp -rv patches/hl2sdk-cs2/. libraries/hl2sdk-cs2/
+
+      - name: Build
+        run: |
+          mkdir -p build
+          cd build
+          cmake -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} ..
+          cmake --build . --config ${{env.BUILD_TYPE}} -- /m:16
+
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p out
+          cp build/${{env.BUILD_TYPE}}/*.dll out/
+          cd out && sha256sum *.dll > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: counterstrikesharp-native-windows-${{ env.SEMVER }}-${{ env.GITHUB_SHA_SHORT }}
+          path: out/

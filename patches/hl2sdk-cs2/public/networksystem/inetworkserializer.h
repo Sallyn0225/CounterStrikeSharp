@@ -1,0 +1,353 @@
+#ifndef NETWORKSERIALIZER_H
+#define NETWORKSERIALIZER_H
+
+#ifdef _WIN32
+#pragma once
+#endif
+
+#include <platform.h>
+
+#include <networksystem/inetchannel.h>
+#include <networksystem/networksystemtypes.h>
+#include <tier0/utlstring.h>
+#include <tier0/utlcommon.h>
+#include <tier0/bitbuf.h>
+#include <tier0/utldict.h>
+#include <tier0/utlhash.h>
+#include "color.h"
+#include "schemasystem/baseschema.h"
+
+#include <memory>
+#include <cstddef>
+
+class CNetMessage;
+class CNetworkSerializerCodeGenDatabase;
+class CCheckTransmitInfo;
+class CEntityInstance;
+class CNetworkSerializerClassInfo;
+struct NetMessageInfo_t;
+
+enum NetworkValidationMode_t
+{
+
+};
+
+typedef int NetworkMessageId;
+typedef uint8 NetworkGroupId;
+typedef uint NetworkCategoryId;
+
+// Allocates a new message of one type; INetworkMessages::FindOrCreateNetMessage stores it in the message's info
+typedef CNetMessage *( *NetMessageAllocateFn )();
+
+// The registration record INetworkMessages keeps per net message (40 bytes, CNetworkMessages::FindOrCreateNetMessage).
+// Since 14197 (2026-11-11) the engine has no per-message serializer object any more: the "net message handle"
+// that INetworkMessages, IGameEventSystem and INetChannel take and return IS this record, and
+// INetworkMessages::GetNetMessageInfo just returns the handle it is given
+struct NetMessageInfo_t
+{
+	// AMNOTE: Formatted as "%s [%d]" from the proto type name and the id passed to FindOrCreateNetMessage,
+	// e.g. "CUserMessageTextMsg [124]"; FindNetworkMessage compares against the whole string
+	CUtlString m_szName;
+	// Replaces IProtobufBinding::AllocateMessage
+	NetMessageAllocateFn m_pfnAllocate;
+	// Name of the SignonGroup_t passed to FindOrCreateNetMessage ("Generic", "System", "User Messages", ...)
+	CUtlString m_szGroup;
+	NetworkMessageId m_MessageId;
+	// AssociateNetMessageWithChannelCategoryAbstract ORs 1 << category into both, the second only for bRequireHandler
+	int m_nCategories;
+	int m_nRequiredHandlerCategories;
+	NetworkGroupId m_GroupId;
+
+	uint8 m_nBufType : 5; // NetChannelBufType_t
+	// Never sent over the network; its id comes from a local counter rather than from the caller or the name hash
+	uint8 m_bCannotBeNetworked : 1;
+	uint8 m_bUnk001 : 1;
+	// FindOrCreateNetMessage was given SignonGroup_t -1
+	uint8 m_bNoSignonGroup : 1;
+
+	NetChannelBufType_t GetBufType() const { return (NetChannelBufType_t)m_nBufType; }
+};
+
+static_assert( sizeof( void * ) != 8 || ( sizeof( NetMessageInfo_t ) == 40 && offsetof( NetMessageInfo_t, m_MessageId ) == 24
+	&& offsetof( NetMessageInfo_t, m_nCategories ) == 28 && offsetof( NetMessageInfo_t, m_GroupId ) == 36 ), "NetMessageInfo_t layout" );
+
+// The net message handle. Until 14197 this was an abstract class (CNetworkSerializerPB) whose virtuals the helpers
+// below replace; it is now the NetMessageInfo_t itself, so this adds no members and must never be polymorphic:
+// a pointer the engine hands out can be used as either type
+class INetworkMessageInternal : public NetMessageInfo_t
+{
+public:
+	INetworkMessageInternal() = delete;
+	INetworkMessageInternal( const INetworkMessageInternal & ) = delete;
+
+	const char *GetUnscopedName() const { return m_szName.Get(); }
+	NetMessageInfo_t *GetNetMessageInfo() { return this; }
+	const NetMessageInfo_t *GetNetMessageInfo() const { return this; }
+
+	CNetMessage *AllocateMessage() const { return m_pfnAllocate ? m_pfnAllocate() : nullptr; }
+};
+
+static_assert( sizeof( INetworkMessageInternal ) == sizeof( NetMessageInfo_t ), "INetworkMessageInternal must add no members" );
+
+struct NetworkRecipientsFilter_t
+{
+	class CFilterOwner {};
+	using FilterCb = void (CFilterOwner::*)(CCheckTransmitInfo *pInfo, CPlayerBitVec &player_mask);
+
+	enum FilterOwnerType : int8
+	{
+		Filter_Other = 1,
+		Filter_Entity = 2,
+		Filter_FieldOwner = 3
+	};
+
+	CFilterOwner *m_FilterOwner;
+	FilterCb m_FilterFn;
+	const char *m_FilterName;
+	FilterOwnerType m_FitlerOwnerType;
+};
+
+struct NetworkChangePointerCallback_t
+{
+	class CCallbackOwner {};
+	// AMNOTE: nAction is 1 when the pointer is set, 2 when it's cleared, 3 when the pointee changes in place
+	using ChangeCb = void (CCallbackOwner::*)( CEntityInstance *pEntity, uint8 nAction );
+
+	// AMNOTE: Selects the object m_CallbackFn is called on
+	enum CallbackOwnerType : int8
+	{
+		// AMNOTE: The pointer's new value, or the stored owner when it's null
+		Callback_Pointee = 1,
+		// AMNOTE: The object that contains the pointer field
+		Callback_FieldOwner = 2,
+		// AMNOTE: The stored owner
+		Callback_Other = 3
+	};
+
+	const char *m_CallbackName;
+	const char *m_ClassName;
+	CCallbackOwner *m_CallbackOwner;
+	ChangeCb m_CallbackFn;
+	CallbackOwnerType m_CallbackOwnerType;
+};
+
+enum OOPVSUpdates_t
+{
+	OOPVSUpdates_OptOut = 0,
+	OOPVSUpdates_OptIn,
+	OOPVSUpdates_Default,
+};
+
+// AMNOTE: Only struct and polymorphic classes can be allocated through m_pfnManipulator
+enum NetworkClassKind_t
+{
+	ClassKind_Struct = 1,
+	ClassKind_Polymorphic,
+	ClassKind_PolymorphicWithStaticClassInfo,
+	ClassKind_Abstract,
+};
+
+struct VarTypeOverride_t
+{
+	const char *m_FieldName;
+	const char *m_OverrideType;
+};
+
+struct SerializedFieldTypeMapping_t
+{
+	const char *m_FieldName;
+	const char *m_FieldType;
+};
+
+struct UserGroupProxy_t
+{
+	const char *m_ClassName;
+	const char *m_UserGroup;
+	NetworkRecipientsFilter_t::CFilterOwner *m_ProxyOwner;
+	NetworkRecipientsFilter_t::FilterCb m_ProxyFn;
+	NetworkRecipientsFilter_t::FilterOwnerType m_ProxyOwnerType;
+};
+
+enum NetworkReplayCompatFieldFlags_t : uint8
+{
+	NETWORK_REPLAY_COMPAT_FIELD_REGEX = (1 << 0), // m_FieldPath is a regular expression
+	NETWORK_REPLAY_COMPAT_FIELD_AGGREGATED = (1 << 1),
+};
+
+struct NetworkReplayCompatField_t
+{
+	const char *m_FieldPath;
+	const char *m_CallbackName;
+	const char *m_pszClassName;
+	uint8 m_nFlags; // NetworkReplayCompatFieldFlags_t
+};
+
+class CNetworkSerializerFieldInfo
+{
+public:
+	CUtlStringToken m_FieldNameHash;
+	const char *m_pszFieldName;
+	CUtlString m_pszTypeName;
+	CUtlString m_pszRawType;
+	CUtlString m_pszEncodedType;
+	CUtlStringToken m_ClassNameHash;
+	const char *m_pszClassName;
+	int32 m_nFieldSize;
+	int32 m_nFieldOffset;
+	CUtlStringToken m_NetworkAliasHash;
+	const char *m_NetworkAlias;
+	CUtlStringToken m_NetworkTypeAliasHash;
+	const char *m_NetworkTypeAlias;
+
+	// AMNOTE: The constructor zeroes it and nothing else writes it
+	void *m_unk001;
+
+	const char *m_NetworkSerializer;
+	const char *m_NetworkEncoder;
+
+	std::shared_ptr<NetworkRecipientsFilter_t> m_NetworkSendProxyRecipientsFilter;
+	std::shared_ptr<NetworkChangePointerCallback_t> m_NetworkChangePointerCallback;
+
+	int8 m_NetworkPriority;
+
+	SchemaCollectionManipulatorFn_t m_CollectionManipulatorFn;
+	CUtlVector<CUtlString> m_NetworkIncludeByUserGroup;
+	CUtlVector<CUtlString> m_NetworkChangeCb;
+	CUtlVector<CUtlString> m_NetworkChangeTags;
+
+	int m_NetworkBitCount;
+	int m_NetworkEncodeFlags;
+	int m_NetworkVarEmbeddedFieldOffsetDelta;
+	float m_NetworkMin;
+	float m_NetworkMax;
+
+	OOPVSUpdates_t m_NetworkOutOfPVSUpdates;
+	bool m_NetworkBitCountSet;
+	bool m_NetworkVarEmbeddedNotFlattened;
+
+	bool m_NetworkPolymorphic;
+	CUtlString m_pszCodeGenType;
+	CNetworkSerializerClassInfo *m_TypeClassInfo;
+
+	int m_CodeGenValueTypeSize;
+
+	CUtlString m_TypeOverride;
+	CUtlString m_BuiltinUnderlyingType;
+
+	char m_ResourceTypeForInfoType[8];
+	int m_FixedArraySize;
+	char m_IsAtomic;
+	char m_IsBuiltIn;
+	char m_IsEnum;
+	char m_IsCHandle;
+	char m_IsPointer;
+	char m_IsUtlVector;
+	char m_IsFixedArray;
+	char m_IsTypeSafeInt;
+	char m_IsTypeSafeFloat;
+	char m_IsStrongHandle;
+	char m_IsWeakHandle;
+	char m_IsModifierHandle;
+	char m_IsSigned;
+	char m_IsNetArray;
+};
+
+struct SerializerFieldLookup_t
+{
+	SerializerFieldLookup_t( const char *fieldname ) : m_FieldName( fieldname ), m_FieldIndex( 0 ) {}
+
+	CUtlString m_FieldName;
+	int m_FieldIndex;
+};
+
+template<> struct DefaultEqualFunctor<SerializerFieldLookup_t> { bool operator()( SerializerFieldLookup_t a, SerializerFieldLookup_t b ) const { return a.m_FieldName == b.m_FieldName; } };
+template<> struct DefaultHashFunctor<SerializerFieldLookup_t> { unsigned int operator()( SerializerFieldLookup_t a ) const { return HashStringCaseless( a.m_FieldName.String() ); } };
+
+class CNetworkSerializerClassInfo
+{
+public:
+	CNetworkSerializerFieldInfo *FindField( const char *field_name ) const
+	{
+		auto handle = m_FieldLookupTable.Find( field_name );
+
+		if(handle != m_FieldLookupTable.InvalidHandle())
+		{
+			auto elem = m_FieldLookupTable.Element( handle );
+			Assert( elem.m_FieldIndex >= 0 && elem.m_FieldIndex < m_nTotalFieldEntries );
+			return m_Fields[elem.m_FieldIndex];
+		}
+
+		return nullptr;
+	}
+
+public:
+	struct ExcludeIncludeFilter_t
+	{
+		CUtlVector<CUtlString> m_ExcludeList;
+		CUtlVector<CUtlString> m_IncludeList;
+	};
+
+	// AMNOTE: nAction 0 allocates and constructs a new object, 1 destructs and frees pObject,
+	// 2 returns the CNetworkSerializerClassInfo of pObject's most derived class
+	typedef void *(*ManipulatorFn_t)( int nAction, void *pObject );
+
+	CUtlStringToken m_nHash;
+	const char *m_pszClassName;
+	CUtlVector<CNetworkSerializerFieldInfo *> m_Fields;
+	ExcludeIncludeFilter_t m_NetworkFilterByUserGroup;
+	ExcludeIncludeFilter_t m_NetworkFilterByName;
+
+	CUtlHash<SerializerFieldLookup_t> m_FieldLookupTable;
+	int m_nTotalFieldEntries;
+
+	CUtlVectorFixedGrowable<CNetworkSerializerClassInfo *, 1> m_ParentClassInfo;
+	CUtlVector<int> m_ParentClassOffset;
+
+	// AMNOTE: Maps member names like __m_pChainEntity and m_PathIndex to their offsets in the class
+	CUtlDict<uint16> m_MemberOffsets;
+
+	CUtlVector<NetworkOverride_t *> m_NetworkOverrides;
+	// Includes this class and parent overreides
+	CUtlVector<NetworkOverride_t *> m_NetworkFlattenedOverrides;
+
+	CUtlVector<VarTypeOverride_t *> m_NetworkVarTypeOverrides;
+	CUtlVector<SerializedFieldTypeMapping_t *> m_FieldTypeMappings;
+	CUtlVector<UserGroupProxy_t *> m_UserGroupProxies;
+	CUtlVector<NetworkReplayCompatField_t *> m_NetworkReplayCompatFields;
+	CNetworkSerializerCodeGenDatabase *m_pDatabase;
+
+	int32_t m_nClassSize;
+	OOPVSUpdates_t m_NetworkOutOfPVSUpdates;
+	NetworkClassKind_t m_nClassKind;
+
+	ManipulatorFn_t m_pfnManipulator;
+
+	bool m_Initialized;
+	bool m_NetworkVarsAtomic;
+	// AMNOTE: Never set, would skip the MNetworkEnable without CNetworkVar warning
+	bool m_unk301;
+	bool m_NetworkNoBase;
+	bool m_NetworkStructNotInNetworkUtlVectorEmbedded;
+	bool m_NetworkVarEmbeddedNotFlattened;
+	// AMNOTE: Only the constructor writes it
+	bool m_unk401;
+};
+
+class CNetworkSerializerCodeGenDatabase
+{
+public:
+	struct EnumInfo_t
+	{
+		int32_t m_nValue;
+		int8_t m_nFlags;
+	};
+
+	CUtlString m_ModuleName;
+	CUtlDict<CNetworkSerializerClassInfo *> m_ClassInfos;
+	CUtlDict<CNetworkSerializerCodeGenDatabase::EnumInfo_t> m_EnumInfos;
+	CUtlDict<CUtlString> m_AtomicTypeMapping;
+
+	bool m_bDebugSpew;
+};
+
+#endif /* NETWORKSERIALIZER_H */
