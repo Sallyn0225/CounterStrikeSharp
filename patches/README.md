@@ -17,3 +17,14 @@ v1.0.378 在 `PostEventAbstract` 钩子里调用 `pEvent->GetNetMessageInfo()`�
 - `CNetworkMessages` 虚表（RTTI `.?AVCNetworkMessages@@`）36 项。第 8 项 `GetNetMessageInfo` 直接返回参数（为空时返回一个默认记录）；第 9 项 `FindNetworkMessage` 调用 `V_stricmp_fast`；第 10 项 `FindNetworkMessagePartial` 调用 `V_stristr_fast`；第 20 项 `FindOrCreateNetMessage` 用 `"%s [%d]"` 拼消息名。
 - `CGameEventSystem` 虚表 21 项，数量没变。第 16 项（`PostEventAbstract` 的客户端掩码版本）的参数顺序和 SDK 一致，并且通过 `INetworkMessages` 第 8 项取消息信息。
 - 崩溃转储里的 `pEvent`：`+0x00` 指向 `"CUserMessageAudioParameter [144]"`，`+0x18` 是 144。
+
+## 实测（2026-11-12，Windows，CS2 1.41.9.7）
+
+只把官方 1.0.378 安装里的 `bin/win64/counterstrikesharp.dll` 换成这个分支 `0722a59` 编出来的版本，C# API 和各插件都没动。`meta list` 显示 `CounterStrikeSharp (v1.0.378-netmsgfix @ 0722a59)`。
+
+- de_dust2 和 bot 的本地对局跑了大约 10 分钟，没有崩溃（换之前一进地图就崩）。
+- `PrintToChat` 正常（回合伤害统计插件、库存模拟器 `!ws` 的回复），`UserMessage.FromPartialName(...).Send()` 正常（NadeSystem 的 `CCSUsrMsg_RadioText`），聊天命令正常（`!scsp 13` 能回复并换上模型）。
+- 同一天用户自己玩过，确认没问题。
+- 后面的 `70d8814` 只改了代码格式，代码逻辑相同。
+
+官方 CSS 发布支持 1.41.9.7 的版本后，就换回官方版，这个分支不再使用。
